@@ -5,7 +5,9 @@
 ```
 
 ```
-[root@rk3326_64:~]# rrcamd -a 127.0.0.1 -p 8080 -s <path-to-offline-image>/splash.jpg
+[root@rk3326_64:~]# rrcamd -a 0.0.0.0 -p 8080 -s <path-to-offline-image>/splash.jpg
 ```
+
+Type http://<robot-ip>:8080/ into your browser:
 
 ![camera](images/camera.jpg?raw=true "Camera View")
