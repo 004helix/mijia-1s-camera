@@ -24,6 +24,9 @@
 #include <event2/event_struct.h>
 #include <event2/event.h>
 
+/* libturbojpeg */
+#include <turbojpeg.h>
+
 #define HTTP_DEFAULT_ADDR  "127.0.0.1"
 #define HTTP_DEFAULT_PORT  8000
 #define HTTP_READ_TIMEOUT  30
@@ -39,13 +42,23 @@
 const static char boundary_charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 static struct event_base *eb;
 
+static char *splash_file_name = NULL;
+static struct event splash_ev;
 static int splash_len = 0;
 static char *splash_data = NULL;
-static struct event splash_ev;
+static int offline_len = 0;
+static char *offline_data = NULL;
 
-static char rrbuffer[RRCAM_BUFFER_SIZE];
-static int rrbuf_len = 0;
 static int rrcam_fd = -1;
+static char rrbuffer1[RRCAM_BUFFER_SIZE];
+static char rrbuffer2[RRCAM_BUFFER_SIZE];
+static char *rrbuffer = rrbuffer1;
+static int rrbuf_len = 0;
+static char *frame = NULL; // current frame
+static int frame_size = 0; // current frame size
+static char *prev = NULL;  // previous frame
+static int prev_size = 0;  // previous frame size
+static int replace = 0;
 
 struct http_client {
     struct http_client *next;
@@ -70,6 +83,136 @@ char frame_headers[] =
     "Content-Length: %d\r\n"
     "X-Timestamp: 0.000000\r\n"
     "\r\n";
+
+
+static void render_splash_image(const unsigned char *bg, int bg_len, const unsigned char*img, int img_len)
+{
+    tjhandle handle = NULL;
+    unsigned char *bg_raw = NULL;
+    unsigned char *img_raw = NULL;
+    int bg_width, bg_height;
+    int img_width, img_height;
+    int subsamp, colorspace;
+    unsigned char *jpeg = NULL;
+    unsigned long jlen = 0;
+
+    if ((handle = tjInitDecompress()) == NULL)
+        return;
+
+    if (tjDecompressHeader3(handle, bg, bg_len, &bg_width, &bg_height, &subsamp, &colorspace) < 0)
+        goto done;
+
+    if (tjDecompressHeader3(handle, img, img_len, &img_width, &img_height, &subsamp, &colorspace) < 0)
+        goto done;
+
+    if ((bg_raw = malloc(bg_width*bg_height)) == NULL)
+        goto done;
+
+    if ((img_raw = malloc(img_width*img_height)) == NULL)
+        goto done;
+
+    if (tjDecompress2(handle, bg, bg_len, bg_raw, bg_width, 0, bg_height, TJPF_GRAY, 0) < 0)
+        goto done;
+
+    if (tjDecompress2(handle, img, img_len, img_raw, img_width, 0, img_height, TJPF_GRAY, 0) < 0)
+        goto done;
+
+    tjDestroy(handle);
+    handle = NULL;
+
+    if (bg_height > img_height) {
+        int hoff = (bg_height - img_height) / 2;
+        int h;
+
+        if (bg_width > img_width) {
+            int woff = (bg_width - img_width) / 2;
+
+            for (h = 0; h < img_height; h++)
+                memcpy(bg_raw + ((h + hoff) * bg_width) + woff, img_raw + (h * img_width), img_width);
+        } else {
+            int woff = (img_width - bg_width) / 2;
+
+            for (h = 0; h < img_height; h++)
+                memcpy(bg_raw + ((h + hoff) * bg_width), img_raw + (h * img_width) + woff, bg_width);
+        }
+    } else {
+        int hoff = (img_height - bg_height) / 2;
+        int h;
+
+        if (bg_width > img_width) {
+            int woff = (bg_width - img_width) / 2;
+
+            for (h = 0; h < bg_height; h++)
+                memcpy(bg_raw + (h * bg_width) + woff, img_raw + ((h + hoff) * img_width), img_width);
+        } else {
+            int woff = (img_width - bg_width) / 2;
+
+            for (h = 0; h < bg_height; h++)
+                memcpy(bg_raw + (h * bg_width), img_raw + ((h + hoff) * img_width) + woff, bg_width);
+        }
+    }
+
+    free(img_raw);
+    img_raw = NULL;
+
+    if ((handle = tjInitCompress()) == NULL)
+        goto done;
+
+    if (tjCompress2(handle, bg_raw, bg_width, 0, bg_height, TJPF_GRAY, &jpeg, &jlen, TJSAMP_GRAY, 85, TJFLAG_FASTDCT) != 0)
+        goto done;
+
+    if ((img_raw = malloc(jlen)) == NULL)
+        goto done;
+
+    memcpy(img_raw, jpeg, jlen);
+    free(splash_data);
+    splash_data = (char *)img_raw;
+    splash_len = jlen;
+    img_raw = NULL;
+
+    if (replace) {
+        char *new_file_name;
+        int fd;
+
+        new_file_name = malloc(strlen(splash_file_name) + 5);
+        if (new_file_name == NULL)
+            goto done;
+
+        strcpy(new_file_name, splash_file_name);
+        strcat(new_file_name, ".tmp");
+
+        fd = open(new_file_name, O_WRONLY | O_TRUNC | O_CREAT);
+        if (fd == -1) {
+            free(new_file_name);
+            goto done;
+        }
+
+        if (write(fd, splash_data, splash_len) != splash_len) {
+            close(fd);
+            unlink(new_file_name);
+            free(new_file_name);
+            goto done;
+        }
+
+        close(fd);
+
+        if (rename(new_file_name, splash_file_name) == -1)
+            unlink(new_file_name);
+
+        free(new_file_name);
+    }
+
+    done:
+    if (jpeg != NULL)
+        tjFree(jpeg);
+    if (img_raw != NULL)
+        free(img_raw);
+    if (bg_raw != NULL)
+        free(bg_raw);
+    if (handle != NULL)
+        tjDestroy(handle);
+    return;
+}
 
 
 static void http_client_close(struct http_client *client)
@@ -101,6 +244,11 @@ static void on_splash_timer(int fd, short ev, void *arg)
 
     if (rrcam_fd != -1)
         return;
+
+    if (prev != splash_data) {
+        prev = splash_data;
+        prev_size = splash_len;
+    }
 
     if (http_clients != NULL)
         headers_len = snprintf(headers, sizeof(headers),
@@ -152,7 +300,7 @@ static void on_rrcam_read(int fd, short ev, void *arg)
 {
     struct event *rrev = (struct event *)arg;
     struct http_client *client;
-    uint32_t frame_size;
+    uint32_t payload_size;
     size_t headers_len;
     char headers[256];
     size_t size;
@@ -188,11 +336,14 @@ static void on_rrcam_read(int fd, short ev, void *arg)
     if (rrbuf_len < 4)
         return;
 
-    frame_size = *(uint32_t *)rrbuffer;
+    payload_size = *(uint32_t *)rrbuffer;
 
-    /* check frame size */
-    if (frame_size > rrbuf_len + 4)
+    /* check payload size */
+    if (payload_size > rrbuf_len + 4)
         return;
+
+    frame = rrbuffer + 4;
+    frame_size = payload_size;
 
     /* send frame to http clients */
     if (http_clients != NULL)
@@ -238,13 +389,26 @@ static void on_rrcam_read(int fd, short ev, void *arg)
         client = client->next;
     }
 
-    /* move data in rrbuffer */
-    size = rrbuf_len - frame_size - 4;
+    /* swap rrbuffers */
+    size = rrbuf_len - payload_size - 4;
+
+    if (rrbuffer == rrbuffer1)
+        rrbuffer = rrbuffer2;
+    else
+        rrbuffer = rrbuffer1;
 
     if (size > 0)
-        memmove(rrbuffer, rrbuffer + frame_size + 4, size);
+        memcpy(rrbuffer, frame + frame_size, size);
 
     rrbuf_len = size;
+
+    /* save previous frame */
+    prev = frame;
+    prev_size = frame_size;
+
+    /* reset current frame */
+    frame = NULL;
+    frame_size = 0;
 
     /* retry parse left data in buffer */
     if (rrbuf_len > 0)
@@ -253,6 +417,7 @@ static void on_rrcam_read(int fd, short ev, void *arg)
     return;
 
     close:
+    render_splash_image((unsigned char *)prev, prev_size, (unsigned char *)offline_data, offline_len);
     event_del(rrev);
     close(rrcam_fd);
     rrcam_fd = -1;
@@ -328,6 +493,29 @@ static void on_http_read(int fd, short ev, void *arg)
     free(client->request);
     client->request = NULL;
     client->reqsize = 0;
+
+    /* handle first frame */
+    if (prev) {
+        struct iovec iov[3];
+        char headers[256];
+        char bndbuf[64];
+
+        iov[0].iov_base = headers;
+        iov[0].iov_len = snprintf(headers, sizeof(headers),
+                                  frame_headers, prev_size);
+        iov[1].iov_base = prev;
+        iov[1].iov_len = prev_size;
+        iov[2].iov_base = bndbuf;
+        iov[2].iov_len = snprintf(bndbuf, sizeof(bndbuf),
+                                  "--%s\r\n", client->boundary);
+
+        ret = writev(client->fd, iov, 3);
+
+        if (ret == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            warn("error writing frame");
+            goto close;
+        }
+    }
 
     /* reschedule read event without read timeout */
     event_del(&client->ev);
@@ -416,6 +604,13 @@ static void on_rrcam_accept(int fd, short ev, void *arg)
     }
 
     rrcam_fd = client_fd;
+    rrbuf_len = 0;
+
+    prev = splash_data;
+    prev_size = splash_len;
+
+    frame = NULL;
+    frame_size = 0;
 
     /* schedule read event */
     event_assign(rrev, eb, rrcam_fd, EV_READ | EV_TIMEOUT | EV_PERSIST, on_rrcam_read, rrev);
@@ -432,7 +627,9 @@ static void usage(int exit_code) {
             " -h, --help            show this help\n"
             " -a, --addr=ADDRESS    listen address, default loopback\n"
             " -p, --port=PORT       listen port, default 8080\n"
-            " -s, --splash          splash screen file location (mandatory option)\n"
+            " -s, --splash=FILE     splash screen jpeg file location (mandatory option)\n"
+            " -o, --offline=FILE    offline image jpeg file location (mandatory option)\n"
+            " -r, --replace         save new splash image when camera disconnected\n"
             "\n"
             "Requests:\n"
             " GET /                 play mjpeg stream\n"
@@ -478,11 +675,13 @@ int main(int argc, char **argv)
             {"help", no_argument, NULL, 'h'},
             {"addr", required_argument, NULL, 'a'},
             {"port", required_argument, NULL, 'p'},
-            {"splash", no_argument, NULL, 's'},
+            {"splash", required_argument, NULL, 's'},
+            {"offline", required_argument, NULL, 'o'},
+            {"replace", no_argument, NULL, 'r'},
             {NULL, 0, NULL, 0}
         };
 
-        c = getopt_long(argc, argv, "ha:p:s:", long_options, &option_index);
+        c = getopt_long(argc, argv, "ha:p:s:o:r", long_options, &option_index);
 
         if (c == -1)
             break;
@@ -530,8 +729,40 @@ int main(int argc, char **argv)
 
                 splash_len = (int)st.st_size;
                 close(fd);
+
+                splash_file_name = strdup(optarg);
+                if (splash_file_name == NULL)
+                    errx(EXIT_FAILURE, "Cannot allocate memory");
+
                 break;
             }
+
+            case 'o': {
+                int fd = open(optarg, O_RDONLY);
+                struct stat st;
+
+                if (fd == -1)
+                    err(EXIT_FAILURE, "failed to open() offline file");
+
+                if (fstat(fd, &st) == -1)
+                    err(EXIT_FAILURE, "failed to fstat() offline file");
+
+                if (st.st_size > RRCAM_BUFFER_SIZE)
+                    errx(EXIT_FAILURE, "offline file too big");
+
+                if ((offline_data = malloc(st.st_size)) == NULL)
+                    errx(EXIT_FAILURE, "cannot allocate memory");
+
+                if (read(fd, offline_data, st.st_size) != st.st_size)
+                    err(EXIT_FAILURE, "failed to read() offline file");
+
+                offline_len = (int)st.st_size;
+                close(fd);
+                break;
+            }
+
+            case 'r':
+                replace++;
 
             case '?':
                 /* getopt_long already printed an error message. */
@@ -547,7 +778,7 @@ int main(int argc, char **argv)
         usage(EXIT_FAILURE);
     }
 
-    if (splash_data == NULL)
+    if (splash_data == NULL || offline_data == NULL)
         usage(EXIT_FAILURE);
 
     /* setup default values */
@@ -599,6 +830,10 @@ int main(int argc, char **argv)
 
     if (listen(httpd, 5) < 0)
         err(EXIT_FAILURE, "httpd listen failed");
+
+    /* set previous frame to slash */
+    prev = splash_data;
+    prev_size = splash_len;
 
     /* start splash event loop */
     event_assign(&splash_ev, eb, -1, EV_PERSIST, on_splash_timer, NULL);

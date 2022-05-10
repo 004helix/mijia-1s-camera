@@ -8,5 +8,5 @@ set -x
 	-D_LARGEFILE_SOURCE \
 	-D_LARGEFILE64_SOURCE \
 	-D_FILE_OFFSET_BITS=64 \
-	-Wall rrcamd.c -o rrcamd -l:libevent_core.a && \
+	-Wall rrcamd.c -o rrcamd -l:libevent_core.a -lturbojpeg && \
 ../buildroot-2018.02.12/output/host/bin/aarch64-buildroot-linux-gnu-strip rrcamd
