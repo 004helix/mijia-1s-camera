@@ -181,7 +181,7 @@ static void render_splash_image(const unsigned char *bg, int bg_len, const unsig
         strcpy(new_file_name, splash_file_name);
         strcat(new_file_name, ".tmp");
 
-        fd = open(new_file_name, O_WRONLY | O_TRUNC | O_CREAT);
+        fd = open(new_file_name, O_WRONLY | O_TRUNC | O_CREAT, 0644);
         if (fd == -1) {
             free(new_file_name);
             goto done;
